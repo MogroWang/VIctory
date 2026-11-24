@@ -1,0 +1,83 @@
+name: build-victory
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "release = 常规构建；diag = 诊断构建（VICTORY_* 环境变量生效）"
+        type: choice
+        options: [release, diag]
+        default: release
+      publish_release:
+        description: "构建完成后创建 Release（不受 90 天产物过期限制）"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-victory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      PROFILE: ${{ inputs.profile || 'release' }}
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 rust-toolchain.toml 指定的工具链
+        shell: pwsh
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: 缓存 cargo 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: 编译
+        shell: pwsh
+        run: |
+          if ($env:PROFILE -eq 'diag') {
+            cargo build --profile diag -p victory --features diagnostics
+            $bin = 'target/diag'
+          } else {
+            cargo build --release -p victory
+            $bin = 'target/release'
+          }
+          if (-not (Test-Path "$bin/victory.exe")) { throw "构建失败：未生成 $bin/victory.exe" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "$bin/victory.exe" dist/
+          if (Test-Path "$bin/victory.pdb") { Copy-Item "$bin/victory.pdb" dist/ }
+          Copy-Item victory.example.toml dist/
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-${{ env.PROFILE }}-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 创建 Release（可选）
+        if: ${{ github.event_name == 'push' || inputs.publish_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "build-${{ github.run_number }}-${{ env.PROFILE }}"
+          Compress-Archive -Path dist/* -DestinationPath "$tag.zip"
+          gh release create $tag "$tag.zip" --repo ${{ github.repository }} --title "$tag" --prerelease --notes "自动构建，未经过人工测试。GPL-3.0-or-later，源码见本仓库同一 commit。需要自备自己合法持有的游戏文件。"
